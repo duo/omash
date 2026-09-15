@@ -26,8 +26,12 @@ use std::io::{self, stdout};
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let config = Config::load(&cli)?;
-    if let Some(Command::Bar(args)) = &cli.command {
-        return statusbar::run(&config, &args.command).await;
+    match &cli.command {
+        Some(Command::Bar(args)) => return statusbar::run(&config, &args.command).await,
+        Some(Command::Stop) => return core::cli_stop().await,
+        Some(Command::Start) => return core::cli_start().await,
+        Some(Command::Restart) => return core::cli_restart().await,
+        None => {}
     }
     core::ensure_system_core()?;
     if cli.daemon {

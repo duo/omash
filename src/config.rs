@@ -3,6 +3,8 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use std::{fs, path::PathBuf, time::Duration};
 
+use crate::profiles::CoreKind;
+
 #[derive(Debug, Default, Deserialize)]
 struct RuntimeConfig {
     #[serde(rename = "proxy-groups", default)]
@@ -35,6 +37,12 @@ pub enum Command {
     /// Internal status-bar integration
     #[command(hide = true)]
     Bar(BarArgs),
+    /// Stop the proxy core and clear the system proxy
+    Stop,
+    /// Start the proxy core and re-apply the system proxy
+    Start,
+    /// Restart the proxy core
+    Restart,
 }
 
 #[derive(Debug, Args)]
@@ -64,7 +72,7 @@ impl ProxyMode {
 pub enum BarCommand {
     /// Print status-bar state as JSON
     State,
-    /// Change the Mihomo routing mode
+    /// Change the core routing mode
     Mode { mode: ProxyMode },
     /// Select a proxy in a selector group
     Proxy { group: String, proxy: String },
@@ -158,20 +166,30 @@ impl Config {
             .join("omash")
     }
 
-    pub fn mihomo_path() -> PathBuf {
-        PathBuf::from("/usr/bin/mihomo")
+    pub fn core_path(core: CoreKind) -> PathBuf {
+        PathBuf::from(match core {
+            CoreKind::Mihomo => "/usr/bin/mihomo",
+            CoreKind::Singbox => "/usr/bin/sing-box",
+        })
     }
 
     pub fn profiles_dir() -> PathBuf {
         Self::data_dir().join("profiles")
     }
 
-    pub fn runtime_path() -> PathBuf {
-        Self::data_dir().join("runtime.yaml")
+    pub fn runtime_path_for(core: CoreKind) -> PathBuf {
+        Self::data_dir().join(format!("runtime.{}", core.extension()))
     }
 
     pub fn proxy_group_order() -> Vec<String> {
-        fs::read_to_string(Self::runtime_path())
+        let singbox_runtime = Self::runtime_path_for(CoreKind::Singbox);
+        if singbox_runtime.is_file() {
+            return fs::read_to_string(singbox_runtime)
+                .ok()
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+                .map_or_else(Vec::new, |value| singbox_group_order(&value));
+        }
+        fs::read_to_string(Self::runtime_path_for(CoreKind::Mihomo))
             .ok()
             .and_then(|text| serde_yaml_ng::from_str::<RuntimeConfig>(&text).ok())
             .map(|config| {
@@ -245,6 +263,30 @@ impl Config {
     }
 }
 
+fn singbox_group_order(config: &serde_json::Value) -> Vec<String> {
+    config
+        .get("outbounds")
+        .and_then(serde_json::Value::as_array)
+        .map(|outbounds| {
+            outbounds
+                .iter()
+                .filter(|outbound| {
+                    outbound
+                        .get("type")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|kind| matches!(kind, "selector" | "urltest"))
+                })
+                .filter_map(|outbound| {
+                    outbound
+                        .get("tag")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,5 +334,20 @@ mod tests {
         assert!(!migrated.contains("manage_core"));
         assert!(!migrated.contains("mihomo_path"));
         assert!(!migrated.contains("tun"));
+    }
+
+    #[test]
+    fn singbox_group_order_tracks_outbound_declaration() {
+        let config: serde_json::Value = serde_json::from_str(
+            r#"{"outbounds":[
+                {"type":"selector","tag":"AI"},
+                {"type":"direct","tag":"direct"},
+                {"type":"urltest","tag":"Auto"},
+                {"type":"block","tag":"block"}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(singbox_group_order(&config), vec!["AI", "Auto"]);
+        assert!(singbox_group_order(&serde_json::json!({})).is_empty());
     }
 }

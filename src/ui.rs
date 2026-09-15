@@ -381,8 +381,8 @@ fn draw_page_header(frame: &mut Frame, app: &App, area: Rect) {
         Tab::Proxies => "Choose routing groups and test node latency",
         Tab::Profiles => "Manage local and remote configuration profiles",
         Tab::Connections => "Inspect and close active network sessions",
-        Tab::Rules => "Review the policies currently loaded by Mihomo",
-        Tab::Logs => "Recent runtime output from the system Mihomo core",
+        Tab::Rules => "Review the policies currently loaded by the proxy core",
+        Tab::Logs => "Recent runtime output from the managed core",
         Tab::Settings => "Core behavior, networking and application maintenance",
         Tab::Help => "Keyboard and mouse shortcuts",
     };
@@ -569,7 +569,7 @@ fn dashboard(frame: &mut Frame, app: &App, area: Rect) {
                 if app.profiles.items.is_empty() {
                     vec![
                         Line::styled(
-                            "Mihomo has not started.",
+                            "The proxy core has not started.",
                             Style::default()
                                 .fg(app.theme.warning)
                                 .add_modifier(Modifier::BOLD),
@@ -581,7 +581,7 @@ fn dashboard(frame: &mut Frame, app: &App, area: Rect) {
                         ),
                         Line::from(""),
                         Line::styled(
-                            "Open Profiles and press a to import a local YAML or subscription URL.",
+                            "Open Profiles and press a to import a local YAML/JSON or subscription URL.",
                             Style::default().fg(app.theme.muted),
                         ),
                     ]
@@ -665,19 +665,19 @@ fn profiles(frame: &mut Frame, app: &App, area: Rect) {
             Paragraph::new(vec![
                 Line::from(""),
                 Line::styled(
-                    "Mihomo is not running because no profile has been imported.",
+                    "The proxy core is not running because no profile has been imported.",
                     Style::default()
                         .fg(app.theme.warning)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Line::from(""),
                 Line::styled(
-                    "Press a to import a local Clash/Mihomo YAML file or a subscription URL.",
+                    "Press a to import a local Clash/Mihomo YAML or sing-box JSON file, or a subscription URL.",
                     Style::default().fg(app.theme.foreground),
                 ),
                 Line::from(""),
                 Line::styled(
-                    "Mihomo will start automatically after the profile is validated and imported.",
+                    "The core starts automatically once the profile is validated and imported.",
                     Style::default().fg(app.theme.muted),
                 ),
             ])
@@ -708,6 +708,7 @@ fn profiles(frame: &mut Frame, app: &App, area: Rect) {
             active.into(),
             profile.name.clone(),
             format!("{:?}", profile.kind),
+            profile.core.as_str().to_string(),
             usage,
             profile.updated.to_string(),
         ])
@@ -716,14 +717,15 @@ fn profiles(frame: &mut Frame, app: &App, area: Rect) {
         rows,
         [
             Constraint::Length(3),
-            Constraint::Percentage(30),
-            Constraint::Length(10),
-            Constraint::Percentage(25),
+            Constraint::Percentage(28),
+            Constraint::Length(8),
+            Constraint::Length(13),
+            Constraint::Percentage(22),
             Constraint::Length(14),
         ],
     )
     .header(
-        Row::new(["", "Name", "Type", "Subscription", "Updated"])
+        Row::new(["", "Name", "Kind", "Core", "Subscription", "Updated"])
             .style(
                 Style::default()
                     .fg(app.theme.muted)
@@ -1033,7 +1035,7 @@ fn logs(frame: &mut Frame, app: &App, area: Rect) {
         .map(|line| ListItem::new(line.as_str()))
         .collect();
     frame.render_widget(
-        List::new(items).block(panel(" Mihomo logs ", &app.theme)),
+        List::new(items).block(panel(" Core logs ", &app.theme)),
         area,
     );
 }
@@ -1042,7 +1044,7 @@ fn settings(frame: &mut Frame, app: &App, area: Rect) {
     let [settings_area, updates_area] = settings_areas(area);
     let values = [
         (
-            "Keep Mihomo running",
+            "Keep core running",
             on_off(crate::core::core_desired_enabled()),
         ),
         ("Start on login", on_off(app.config.auto_start)),
@@ -1072,7 +1074,10 @@ fn settings(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(vec![
-                Span::styled("Mihomo  ", Style::default().fg(app.theme.muted)),
+                Span::styled(
+                    format!("{:<10}", app.profiles.current_core().as_str()),
+                    Style::default().fg(app.theme.muted),
+                ),
                 Span::styled(
                     value_or_dash(&app.snapshot.version.version),
                     Style::default().fg(app.theme.foreground),
@@ -1253,7 +1258,7 @@ fn draw_import_input(frame: &mut Frame, app: &App) {
     ])
     .split(inner);
     frame.render_widget(
-        Paragraph::new("Paste a subscription URL or enter an absolute local YAML path.")
+        Paragraph::new("Paste a subscription URL or enter an absolute local YAML/JSON path.")
             .style(Style::default().fg(app.theme.foreground)),
         rows[0],
     );
@@ -1262,7 +1267,7 @@ fn draw_import_input(frame: &mut Frame, app: &App) {
     let visible = input_tail(&app.input_buffer, field_width);
     let field_content = if app.input_buffer.is_empty() {
         Line::styled(
-            "https://… or /home/you/Downloads/config.yaml",
+            "https://… or /home/you/Downloads/config.yaml / sing-box.json",
             Style::default().fg(app.theme.muted),
         )
     } else {
@@ -1288,7 +1293,7 @@ fn draw_import_input(frame: &mut Frame, app: &App) {
     ));
 
     frame.render_widget(
-        Paragraph::new("The profile is validated before Mihomo starts.")
+        Paragraph::new("The profile is validated before the core starts.")
             .style(Style::default().fg(app.theme.muted)),
         rows[2],
     );
@@ -1302,7 +1307,7 @@ fn draw_import_input(frame: &mut Frame, app: &App) {
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("FILE  ", Style::default().fg(app.theme.muted)),
-            Span::raw("/home/you/Downloads/config.yaml"),
+            Span::raw("/home/you/Downloads/config.yaml or sing-box.json"),
         ])),
         rows[5],
     );

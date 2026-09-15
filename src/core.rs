@@ -1,4 +1,8 @@
-use crate::{api::MihomoClient, config::Config, profiles::Profiles};
+use crate::{
+    api::MihomoClient,
+    config::Config,
+    profiles::{CoreKind, Profiles},
+};
 use anyhow::{Context, Result, bail};
 use chrono::Local;
 use serde::{Deserialize, Serialize};
@@ -44,45 +48,61 @@ impl CoreManager {
         profiles: &Profiles,
         commit: bool,
     ) -> Result<()> {
-        ensure_core_resources()?;
-        let runtime = Config::runtime_path();
-        let nonce = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let staged = runtime.with_file_name(format!(
-            "runtime.pending-{}-{nonce}.yaml",
-            std::process::id()
-        ));
-        profiles.build_runtime_at(config, &staged)?;
-        let mut command = Command::new(Config::mihomo_path());
-        command
-            .args(["-t", "-d"])
-            .arg(Config::data_dir())
-            .arg("-f")
-            .arg(&staged)
-            .kill_on_drop(true);
-        let output = match tokio::time::timeout(VALIDATION_TIMEOUT, command.output()).await {
-            Ok(Ok(output)) => output,
-            Ok(Err(error)) => {
-                let _ = fs::remove_file(&staged);
-                return Err(error).context("failed to execute Mihomo validator");
-            }
-            Err(_) => {
-                let _ = fs::remove_file(&staged);
-                bail!("Mihomo configuration validation timed out after 30 seconds");
-            }
-        };
-        if !output.status.success() {
-            let _ = fs::remove_file(&staged);
-            bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+        let core = profiles.current_core();
+        if core == CoreKind::Mihomo {
+            ensure_core_resources()?;
         }
+        let runtime = Config::runtime_path_for(core);
+        let staged = staged_runtime_path(core);
+        profiles.build_runtime_at(config, &staged)?;
+        Self::check_runtime(core, &staged).await?;
         if commit {
             fs::rename(&staged, &runtime).with_context(|| {
                 format!("failed to commit validated runtime {}", runtime.display())
             })?;
         } else {
             fs::remove_file(&staged)?;
+        }
+        Ok(())
+    }
+
+    async fn check_runtime(core: CoreKind, staged: &Path) -> Result<()> {
+        let mut command = Command::new(Config::core_path(core));
+        match core {
+            CoreKind::Mihomo => {
+                command
+                    .args(["-t", "-d"])
+                    .arg(Config::data_dir())
+                    .arg("-f")
+                    .arg(staged);
+            }
+            CoreKind::Singbox => {
+                command
+                    .args(["check", "-c"])
+                    .arg(staged)
+                    .arg("-D")
+                    .arg(Config::data_dir())
+                    .arg("--disable-color");
+            }
+        }
+        command.kill_on_drop(true);
+        let output = match tokio::time::timeout(VALIDATION_TIMEOUT, command.output()).await {
+            Ok(Ok(output)) => output,
+            Ok(Err(error)) => {
+                let _ = fs::remove_file(staged);
+                return Err(error).context(format!("failed to execute {} validator", core.as_str()));
+            }
+            Err(_) => {
+                let _ = fs::remove_file(staged);
+                bail!(
+                    "{} configuration validation timed out after 30 seconds",
+                    core.as_str()
+                );
+            }
+        };
+        if !output.status.success() {
+            let _ = fs::remove_file(staged);
+            bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
         }
         Ok(())
     }
@@ -96,32 +116,52 @@ impl CoreManager {
     }
 
     async fn start_validated(&mut self, config: &Config, profiles: &Profiles) -> Result<()> {
-        let log_path =
-            Config::logs_dir().join(format!("mihomo-{}.log", Local::now().format("%Y-%m-%d")));
+        let core = profiles.current_core();
+        let log_path = Config::logs_dir().join(format!(
+            "{}-{}.log",
+            core.as_str(),
+            Local::now().format("%Y-%m-%d")
+        ));
         let stdout = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&log_path)?;
         let stderr = stdout.try_clone()?;
-        let mut child = Command::new(Config::mihomo_path())
-            .arg("-d")
-            .arg(Config::data_dir())
-            .arg("-f")
-            .arg(Config::runtime_path())
+        let runtime = Config::runtime_path_for(core);
+        let mut command = Command::new(Config::core_path(core));
+        match core {
+            CoreKind::Mihomo => {
+                command
+                    .arg("-d")
+                    .arg(Config::data_dir())
+                    .arg("-f")
+                    .arg(&runtime);
+            }
+            CoreKind::Singbox => {
+                command
+                    .args(["run", "-c"])
+                    .arg(&runtime)
+                    .arg("-D")
+                    .arg(Config::data_dir())
+                    .arg("--disable-color");
+            }
+        }
+        let mut child = command
             .stdin(Stdio::null())
             .stdout(stdout)
             .stderr(stderr)
             .kill_on_drop(true)
             .spawn()
-            .context("failed to start Mihomo")?;
+            .context(format!("failed to start {}", core.as_str()))?;
 
         let api = MihomoClient::new(&config.controller, config.secret.clone())?;
-        let mut last_error = "Mihomo API did not answer".to_owned();
+        let mut last_error = format!("{} API did not answer", core.as_str());
         let mut ready = false;
         for attempt in 0..CORE_READINESS_ATTEMPTS {
             if let Some(status) = child.try_wait()? {
                 bail!(
-                    "Mihomo exited during startup with {status}; see {}",
+                    "{} exited during startup with {status}; see {}",
+                    core.as_str(),
                     log_path.display()
                 );
             }
@@ -141,7 +181,8 @@ impl CoreManager {
             let _ = child.start_kill();
             let _ = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
             bail!(
-                "Mihomo API did not become ready: {last_error}; see {}",
+                "{} API did not become ready: {last_error}; see {}",
+                core.as_str(),
                 log_path.display()
             );
         }
@@ -159,11 +200,32 @@ impl CoreManager {
     }
 
     pub async fn restart(&mut self, config: &Config, profiles: &Profiles) -> Result<ConfigApply> {
-        self.validate(config, profiles).await?;
-        let api = MihomoClient::new(&config.controller, config.secret.clone())?;
-        if api.reload_config(&Config::runtime_path()).await.is_ok() {
+        let core = profiles.current_core();
+        if core == CoreKind::Mihomo {
+            ensure_core_resources()?;
+        }
+        let runtime = Config::runtime_path_for(core);
+        let staged = staged_runtime_path(core);
+        profiles.build_runtime_at(config, &staged)?;
+        // Selection changes only rewrite profiles.yaml; when the rebuilt
+        // runtime config is identical, keep the running core and re-apply the
+        // stored selections instead of bouncing the process.
+        if runtime.is_file() && fs::read(&runtime)? == fs::read(&staged)? {
+            fs::remove_file(&staged)?;
             let _ = restore_selected_nodes(config, profiles).await;
             return Ok(ConfigApply::Reloaded);
+        }
+        Self::check_runtime(core, &staged).await?;
+        fs::rename(&staged, &runtime)
+            .with_context(|| format!("failed to commit validated runtime {}", runtime.display()))?;
+        // sing-box's Clash API ignores mihomo's `path` reload extension, so it
+        // always needs a process restart to pick up a new runtime config.
+        if core == CoreKind::Mihomo {
+            let api = MihomoClient::new(&config.controller, config.secret.clone())?;
+            if api.reload_config(&runtime).await.is_ok() {
+                let _ = restore_selected_nodes(config, profiles).await;
+                return Ok(ConfigApply::Reloaded);
+            }
         }
         self.stop().await?;
         self.start_validated(config, profiles).await?;
@@ -196,12 +258,31 @@ impl CoreManager {
     }
 }
 
+fn staged_runtime_path(core: CoreKind) -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    Config::runtime_path_for(core).with_file_name(format!(
+        "runtime.pending-{}-{nonce}.{}",
+        std::process::id(),
+        core.extension()
+    ))
+}
+
 pub fn ensure_system_core() -> Result<()> {
-    let path = Config::mihomo_path();
+    let profiles = Profiles::load().unwrap_or_default();
+    if profiles.items.is_empty() {
+        return Ok(());
+    }
+    let core = profiles.current_core();
+    let path = Config::core_path(core);
     if !path.is_file() {
         bail!(
-            "system Mihomo not found at {}; install the Arch mihomo package",
-            path.display()
+            "system {} not found at {}; install the Arch {} package",
+            core.as_str(),
+            path.display(),
+            core.as_str()
         );
     }
     Ok(())
@@ -334,7 +415,7 @@ pub async fn run_supervisor(mut config: Config) -> Result<()> {
             state.error = profiles
                 .items
                 .is_empty()
-                .then(|| "Mihomo not started: no profile imported".into());
+                .then(|| "Core not started: no profile imported".into());
         } else if !manager.is_running() {
             let retry_due =
                 last_start_attempt.is_none_or(|attempt| attempt.elapsed() >= START_RETRY_BACKOFF);
@@ -345,7 +426,7 @@ pub async fn run_supervisor(mut config: Config) -> Result<()> {
                 }
                 state.running = false;
                 state.pid = None;
-                state.error = Some("starting Mihomo".into());
+                state.error = Some(format!("starting {}", profiles.current_core().as_str()));
                 write_supervisor_state(&state)?;
                 last_start_attempt = Some(Instant::now());
                 match manager.start(&config, &profiles).await {
@@ -448,6 +529,108 @@ pub fn request_restart() -> Result<()> {
         format!("{}\n", Local::now().timestamp()),
     )?;
     Ok(())
+}
+
+pub async fn cli_stop() -> Result<()> {
+    if !core_desired_enabled() && !supervisor_state().running {
+        println!("omash core is already stopped");
+        return Ok(());
+    }
+    request_core_enabled(false)?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut last = supervisor_state();
+    while Instant::now() < deadline {
+        last = supervisor_state();
+        if !last.running {
+            println!("omash core stopped; system proxy cleared");
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    match last.pid {
+        Some(pid) => println!(
+            "stop requested, but the core is still running (pid {pid}); see {}",
+            Config::logs_dir().display()
+        ),
+        None => println!(
+            "stop requested, but the supervisor did not apply it within 10 seconds; see {}",
+            Config::logs_dir().display()
+        ),
+    }
+    Ok(())
+}
+
+pub async fn cli_start() -> Result<()> {
+    let before = supervisor_state();
+    if core_desired_enabled() && before.running {
+        println!("omash core is already running");
+        return Ok(());
+    }
+    request_core_enabled(true)?;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut last = before.clone();
+    while Instant::now() < deadline {
+        last = supervisor_state();
+        if last.running {
+            match last.pid {
+                Some(pid) => println!("omash core started (pid {pid})"),
+                None => println!("omash core started"),
+            }
+            return Ok(());
+        }
+        if let Some(error) = startup_failure(&before, &last) {
+            println!("omash core failed to start: {error}");
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    println!(
+        "start requested, but the core is not running yet; last state: {}",
+        last.error.unwrap_or_else(|| "no response from supervisor".into())
+    );
+    Ok(())
+}
+
+pub async fn cli_restart() -> Result<()> {
+    if !core_desired_enabled() {
+        println!("omash core is disabled; run `omash start` first");
+        return Ok(());
+    }
+    let before = supervisor_state();
+    request_restart()?;
+    let applied = before.restarts.saturating_add(before.reloads);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let last = supervisor_state();
+        if last.restarts.saturating_add(last.reloads) > applied {
+            match last.pid.filter(|_| last.running) {
+                Some(pid) => println!("omash core restarted (pid {pid})"),
+                None => println!("omash core restarted"),
+            }
+            return Ok(());
+        }
+        if let Some(error) = startup_failure(&before, &last) {
+            println!("omash core restart failed: {error}");
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    println!("restart requested; supervisor did not apply it within 15 seconds");
+    Ok(())
+}
+
+// The supervisor reports "starting <core>" while a start attempt is in flight;
+// only a new, non-transient error compared to the pre-request state means the
+// attempt actually failed.
+fn startup_failure(before: &SupervisorState, last: &SupervisorState) -> Option<String> {
+    let error = last.error.as_ref()?;
+    if error.starts_with("starting ") || last.error == before.error {
+        return None;
+    }
+    Some(error.clone())
 }
 
 fn load_daemon_config() -> Result<Config> {

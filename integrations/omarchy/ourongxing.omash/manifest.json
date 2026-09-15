@@ -14,7 +14,7 @@
   },
   "barWidget": {
     "displayName": "omash",
-    "description": "Switch Mihomo routing modes and selector proxies",
+    "description": "Switch proxy routing modes and selector proxies",
     "category": "Network",
     "allowMultiple": false,
     "defaultSection": "right",

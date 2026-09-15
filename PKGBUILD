@@ -3,11 +3,12 @@
 pkgname=omash
 pkgver=0.1.3
 pkgrel=1
-pkgdesc='Terminal dashboard for Mihomo on Omarchy'
+pkgdesc='Terminal dashboard for Mihomo and sing-box on Omarchy'
 arch=('x86_64')
 url='https://github.com/ourongxing/omash'
 license=('GPL-3.0-only')
 depends=('mihomo' 'clash-geoip')
+optdepends=('sing-box: sing-box core support')
 makedepends=('cargo')
 options=('!lto')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")

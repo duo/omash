@@ -21,6 +21,8 @@ pub struct Profile {
     pub uid: String,
     #[serde(rename = "type")]
     pub kind: ProfileKind,
+    #[serde(default)]
+    pub core: CoreKind,
     pub name: String,
     pub file: String,
     pub url: Option<String>,
@@ -48,6 +50,31 @@ pub enum ProfileKind {
     #[default]
     Remote,
     Local,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CoreKind {
+    #[default]
+    Mihomo,
+    #[serde(rename = "sing-box")]
+    Singbox,
+}
+
+impl CoreKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Mihomo => "mihomo",
+            Self::Singbox => "sing-box",
+        }
+    }
+
+    pub const fn extension(self) -> &'static str {
+        match self {
+            Self::Mihomo => "yaml",
+            Self::Singbox => "json",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
@@ -89,15 +116,17 @@ impl Profiles {
         config: &Config,
     ) -> Result<String> {
         let fetched = fetch_remote_profile(url).await?;
+        let core = detect_core(&fetched.content)?;
         let uid = format!("R{}", Uuid::new_v4().simple());
-        let file = format!("{uid}.yaml");
-        let pending_file = format!(".{uid}.pending.yaml");
+        let file = format!("{uid}.{}", core.extension());
+        let pending_file = format!(".{uid}.pending.{}", core.extension());
         let pending_path = Config::profiles_dir().join(&pending_file);
         atomic_write(&pending_path, fetched.content.as_bytes())?;
         let mut candidate = self.clone();
         candidate.items.push(Profile {
             uid: uid.clone(),
             kind: ProfileKind::Remote,
+            core,
             name: name.unwrap_or("Remote Profile").into(),
             file: pending_file,
             url: Some(url.into()),
@@ -132,16 +161,17 @@ impl Profiles {
         config: &Config,
     ) -> Result<String> {
         let content = fs::read_to_string(source)?;
-        validate_yaml(&content)?;
+        let core = detect_core(&content)?;
         let uid = format!("L{}", Uuid::new_v4().simple());
-        let file = format!("{uid}.yaml");
-        let pending_file = format!(".{uid}.pending.yaml");
+        let file = format!("{uid}.{}", core.extension());
+        let pending_file = format!(".{uid}.pending.{}", core.extension());
         let pending_path = Config::profiles_dir().join(&pending_file);
         atomic_write(&pending_path, content.as_bytes())?;
         let mut candidate = self.clone();
         candidate.items.push(Profile {
             uid: uid.clone(),
             kind: ProfileKind::Local,
+            core,
             name: name
                 .map(str::to_owned)
                 .or_else(|| source.file_stem()?.to_str().map(str::to_owned))
@@ -179,7 +209,7 @@ impl Profiles {
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("local profiles cannot be updated"))?;
         let fetched = fetch_remote_profile(url).await?;
-        let pending_file = format!(".{uid}.pending.yaml");
+        let pending_file = format!(".{uid}.pending.{}", item.core.extension());
         let pending_path = Config::profiles_dir().join(&pending_file);
         atomic_write(&pending_path, fetched.content.as_bytes())?;
 
@@ -262,6 +292,13 @@ impl Profiles {
             .map_or(&[], |profile| profile.selected.as_slice())
     }
 
+    pub fn current_core(&self) -> CoreKind {
+        self.current
+            .as_deref()
+            .and_then(|uid| self.items.iter().find(|item| item.uid == uid))
+            .map_or(CoreKind::Mihomo, |profile| profile.core)
+    }
+
     pub fn build_runtime_at(&self, config: &Config, destination: &Path) -> Result<PathBuf> {
         let uid = self
             .current
@@ -273,32 +310,56 @@ impl Profiles {
             .find(|item| item.uid == uid)
             .ok_or_else(|| anyhow::anyhow!("selected profile not found"))?;
         let path = Config::profiles_dir().join(&item.file);
-        let merge = item
-            .merge
-            .as_ref()
-            .map(|name| Config::profiles_dir().join(name));
-        let owned_chains: Vec<(&str, PathBuf)> = [
-            ("rules", item.rules.as_ref()),
-            ("proxies", item.proxies.as_ref()),
-            ("proxy-groups", item.groups.as_ref()),
-        ]
-        .into_iter()
-        .filter_map(|(key, file)| file.map(|file| (key, Config::profiles_dir().join(file))))
-        .collect();
-        let chains: Vec<_> = owned_chains
-            .iter()
-            .map(|(key, path)| (*key, path.as_path()))
-            .collect();
-        let mut runtime = enhance::build_runtime(&path, merge.as_deref(), &chains)?;
-        enhance::apply_runtime_defaults(
-            &mut runtime,
-            &config.controller,
-            &config.secret,
-            config.mixed_port,
-            config.allow_lan,
-            config.ipv6,
-        );
-        atomic_write(destination, serde_yaml_ng::to_string(&runtime)?.as_bytes())?;
+        match item.core {
+            CoreKind::Mihomo => {
+                let merge = item
+                    .merge
+                    .as_ref()
+                    .map(|name| Config::profiles_dir().join(name));
+                let owned_chains: Vec<(&str, PathBuf)> = [
+                    ("rules", item.rules.as_ref()),
+                    ("proxies", item.proxies.as_ref()),
+                    ("proxy-groups", item.groups.as_ref()),
+                ]
+                .into_iter()
+                .filter_map(|(key, file)| {
+                    file.map(|file| (key, Config::profiles_dir().join(file)))
+                })
+                .collect();
+                let chains: Vec<_> = owned_chains
+                    .iter()
+                    .map(|(key, path)| (*key, path.as_path()))
+                    .collect();
+                let mut runtime = enhance::build_runtime(&path, merge.as_deref(), &chains)?;
+                enhance::apply_runtime_defaults(
+                    &mut runtime,
+                    &config.controller,
+                    &config.secret,
+                    config.mixed_port,
+                    config.allow_lan,
+                    config.ipv6,
+                );
+                atomic_write(destination, serde_yaml_ng::to_string(&runtime)?.as_bytes())?;
+            }
+            CoreKind::Singbox => {
+                let text = fs::read_to_string(&path)
+                    .with_context(|| format!("failed to read {}", path.display()))?;
+                let mut runtime: serde_json::Value = serde_json::from_str(&text)
+                    .with_context(|| format!("invalid JSON in {}", path.display()))?;
+                enhance::apply_singbox_defaults(
+                    &mut runtime,
+                    &config.controller,
+                    &config.secret,
+                    config.mixed_port,
+                    config.allow_lan,
+                )?;
+                atomic_write(destination, serde_json::to_string_pretty(&runtime)?.as_bytes())?;
+            }
+        }
+        let _ = fs::remove_file(Config::runtime_path_for(match item.core {
+            CoreKind::Mihomo => CoreKind::Singbox,
+            CoreKind::Singbox => CoreKind::Mihomo,
+        }));
         Ok(destination.to_path_buf())
     }
 }
@@ -346,7 +407,6 @@ async fn fetch_remote_profile(url: &str) -> Result<FetchedProfile> {
         .and_then(|value| value.parse::<u64>().ok());
     let content = response.text().await?;
     let content = content.trim_start_matches('\u{feff}').to_owned();
-    validate_yaml(&content)?;
     Ok(FetchedProfile {
         content,
         subscription,
@@ -355,12 +415,19 @@ async fn fetch_remote_profile(url: &str) -> Result<FetchedProfile> {
     })
 }
 
-fn validate_yaml(content: &str) -> Result<Mapping> {
-    let mapping: Mapping = serde_yaml_ng::from_str(content).context("profile is not valid YAML")?;
+fn detect_core(content: &str) -> Result<CoreKind> {
+    let content = content.trim_start_matches('\u{feff}');
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(content)
+        && (value.get("outbounds").is_some() || value.get("inbounds").is_some())
+    {
+        return Ok(CoreKind::Singbox);
+    }
+    let mapping: Mapping = serde_yaml_ng::from_str(content)
+        .context("profile is neither a sing-box JSON nor a Clash YAML config")?;
     if !mapping.contains_key("proxies") && !mapping.contains_key("proxy-providers") {
         bail!("profile has neither proxies nor proxy-providers");
     }
-    Ok(mapping)
+    Ok(CoreKind::Mihomo)
 }
 
 fn parse_subscription_info(value: &str) -> Option<SubscriptionInfo> {
@@ -409,5 +476,24 @@ mod tests {
         upsert_selection(&mut selected, "AI", "node-c");
         assert_eq!(selected.len(), 2);
         assert_eq!(selected[0].now, "node-b");
+    }
+
+    #[test]
+    fn detects_profile_core_from_content() {
+        assert_eq!(
+            detect_core("proxies: []\nproxy-groups: []\n").unwrap(),
+            CoreKind::Mihomo
+        );
+        assert_eq!(
+            detect_core(r#"{"outbounds":[{"type":"direct"}]}"#).unwrap(),
+            CoreKind::Singbox
+        );
+        // JSON is valid YAML, so a JSON Clash config must still be mihomo.
+        assert_eq!(
+            detect_core(r#"{"proxies":[{"name":"a"}]}"#).unwrap(),
+            CoreKind::Mihomo
+        );
+        assert!(detect_core("just: a: mapping").is_err());
+        assert!(detect_core("42").is_err());
     }
 }

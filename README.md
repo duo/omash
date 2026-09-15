@@ -24,6 +24,7 @@ so closing `omash` does not stop your proxy.
 ## Features
 
 - Imports local profiles and remote subscriptions, with scheduled updates
+- Runs either the system Mihomo or sing-box core, auto-detected per profile
 - Supports Rule, Global, and Direct modes, proxy selection, and delay tests
 - Manages active connections, Merge enhancements, backups, and logs
 - Uses the system Mihomo and GeoIP packages maintained by Omarchy
@@ -38,6 +39,9 @@ Install the system dependencies first:
 
 ```bash
 omarchy pkg aur add mihomo clash-geoip
+
+# Only needed for sing-box profiles:
+omarchy pkg pacman add sing-box
 
 # Only needed when Cargo is not already installed:
 omarchy install dev-env rust
@@ -129,6 +133,24 @@ uninstaller removes the optional widget, so add it again after updating.
 
 Press `?` for the complete shortcut list. Mouse input is also supported.
 
+## CLI
+
+Besides the TUI, `omash` provides commands to control the proxy core from
+scripts and the shell. They go through the supervisor, so the system proxy is
+applied and cleared consistently:
+
+```bash
+omash stop     # stop the core and clear the system proxy
+omash start    # start the core and re-apply the system proxy
+omash restart  # restart the core (e.g. after editing config.toml)
+```
+
+Use them for controlled configuration changes, for example when moving the
+proxy to a different port: `omash stop`, edit `mixed_port` in
+`~/.config/omash/config.toml`, then `omash start`. Note that applications
+launched through UWSM/systemd keep the proxy port captured at launch time, so
+running applications may need a restart after a port change.
+
 ## Remove
 
 Remove the widget, user service, binary, and legacy system files with:
@@ -161,6 +183,18 @@ proxy_bypass = "localhost,127.0.0.1,::1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12"
 
 `OMASH_REFRESH_MS` and `--refresh-ms` override the configured refresh interval.
 Use `--config <path>` to load a different configuration file.
+
+### sing-box profiles
+
+In addition to Clash/Mihomo YAML, profiles may be sing-box JSON configs,
+either imported from a local file or served from a subscription URL. omash
+detects the format from the profile content and runs the matching system core
+(`/usr/bin/mihomo` or `/usr/bin/sing-box`). For sing-box it injects a managed
+`experimental.clash_api`, a mixed inbound on `mixed_port`, and `clash_mode`
+route rules for Global/Direct (unless the config already defines its own), so
+the dashboard, mode switching, delay tests, and the system proxy keep working
+the same way. Clash-style merge and prepend/append enhancement chains only
+apply to Mihomo profiles.
 
 ### Theme override
 

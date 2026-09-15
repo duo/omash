@@ -411,17 +411,17 @@ impl App {
 
     fn offline_status(&self, api_error: &str) -> String {
         if self.profiles.items.is_empty() {
-            return "Mihomo is not running: no profile imported. Open Profiles and press a to import."
+            return "Proxy core is not running: no profile imported. Open Profiles and press a to import."
                 .into();
         }
         if !core::core_desired_enabled() {
-            return "Mihomo is stopped: disabled in Settings.".into();
+            return "Proxy core is stopped: disabled in Settings.".into();
         }
         self.supervisor
             .error
             .as_ref()
-            .map(|error| format!("Mihomo is not running: {error}"))
-            .unwrap_or_else(|| format!("Mihomo API unavailable: {api_error}"))
+            .map(|error| format!("Proxy core is not running: {error}"))
+            .unwrap_or_else(|| format!("Core API unavailable: {api_error}"))
     }
 
     async fn update_due_profiles(&mut self) {
@@ -619,18 +619,18 @@ impl App {
             KeyCode::Enter => {
                 let value = self.input_buffer.trim().to_owned();
                 if value.is_empty() {
-                    self.status = "Enter a subscription URL or an absolute YAML file path.".into();
+                    self.status =
+                        "Enter a subscription URL or an absolute YAML/JSON file path.".into();
                     return;
                 }
                 self.input_buffer.clear();
                 self.input = None;
+                let value = value.strip_prefix("file://").unwrap_or(&value);
                 let result = if value.starts_with("http://") || value.starts_with("https://") {
-                    self.profiles
-                        .import_remote(&value, None, &self.config)
-                        .await
+                    self.profiles.import_remote(value, None, &self.config).await
                 } else {
                     self.profiles
-                        .import_local(std::path::Path::new(&value), None, &self.config)
+                        .import_local(std::path::Path::new(value), None, &self.config)
                         .await
                 };
                 match result {
@@ -649,11 +649,11 @@ impl App {
         let enable = !core::core_desired_enabled();
         let result = core::request_core_enabled(enable).map(|()| {
             if enable && self.profiles.items.is_empty() {
-                "Mihomo cannot start: no profile imported. Open Profiles and press a to import."
+                "The core cannot start: no profile imported. Open Profiles and press a to import."
             } else if enable {
-                "Mihomo start requested"
+                "Core start requested"
             } else {
-                "Mihomo stop requested"
+                "Core stop requested"
             }
             .to_owned()
         });
