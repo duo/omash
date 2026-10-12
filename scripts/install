@@ -2,8 +2,8 @@
 
 set -euo pipefail
 
-repository=https://github.com/ourongxing/omash
-install_tag=v0.1.3
+repository=https://github.com/duo/omash
+install_branch=main
 build_root=$(mktemp -d -t omash-install.XXXXXXXX)
 
 cleanup() {
@@ -38,15 +38,10 @@ if (( ${#missing_packages[@]} )); then
   exit 1
 fi
 
-if [[ ! $install_tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
-  echo "Invalid omash install tag: $install_tag" >&2
-  exit 1
-fi
-
-archive="$build_root/$install_tag.tar.gz"
-curl -fsSL "$repository/archive/refs/tags/$install_tag.tar.gz" -o "$archive"
+archive="$build_root/$install_branch.tar.gz"
+curl -fsSL "$repository/archive/refs/heads/$install_branch.tar.gz" -o "$archive"
 tar -xzf "$archive" -C "$build_root"
-source_root="$build_root/omash-${install_tag#v}"
+source_root="$build_root/omash-$install_branch"
 
 cargo build --locked --release --manifest-path "$source_root/Cargo.toml"
 
@@ -58,9 +53,13 @@ install -Dm644 "$source_root/systemd/omash-supervisor.service" "$service_path"
 sed -i 's|^ExecStart=.*|ExecStart=%h/.local/bin/omash --daemon|' "$service_path"
 
 systemctl --user daemon-reload
-systemctl --user try-restart omash-supervisor.service
+if [[ -f /etc/omash-tun.json ]] && ! "$binary_path" tun status --check-helper >/dev/null 2>&1; then
+  echo "Installed the new client, but the current TUN helper could not confirm compatibility. Run omash tun setup to update it; setup then restarts the supervisor." >&2
+else
+  systemctl --user try-restart omash-supervisor.service
+fi
 
-echo "Installed omash $install_tag to $binary_path."
+echo "Installed omash from $repository ($install_branch) to $binary_path."
 if [[ :$PATH: == *":$HOME/.local/bin:"* ]]; then
   echo "Run: omash"
 else
