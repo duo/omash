@@ -23,7 +23,10 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{
     cmp::min,
     collections::HashSet,
+    ffi::OsStr,
+    fs,
     io::{self, stdout},
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Command,
     time::Instant,
@@ -109,7 +112,7 @@ pub struct App {
     pub theme: Theme,
     pub supervisor: SupervisorState,
     pub logs: Vec<String>,
-    pub geoip_version: String,
+    pub updates: Updates,
     pub tab: Tab,
     pub group_index: usize,
     pub node_index: usize,
@@ -157,7 +160,7 @@ impl App {
             Config::proxy_group_order(),
             Theme::load(),
             core::supervisor_state(),
-            installed_package_version("clash-geoip"),
+            Updates::detect(),
         )
     }
 
@@ -167,7 +170,7 @@ impl App {
         proxy_group_order: Vec<String>,
         theme: Theme,
         supervisor: SupervisorState,
-        geoip_version: String,
+        updates: Updates,
     ) -> Result<Self> {
         let api = MihomoClient::new(&config.controller, config.secret.clone())?;
         Ok(Self {
@@ -179,7 +182,7 @@ impl App {
             theme,
             supervisor,
             logs: vec![],
-            geoip_version,
+            updates,
             tab: Tab::default(),
             group_index: 0,
             node_index: 0,
@@ -1046,7 +1049,98 @@ async fn install_outside(terminal: &mut Screen, setup: Setup) -> Result<Result<(
     Ok(installed)
 }
 
-fn installed_package_version(name: &str) -> String {
+/// What the Settings page's Updates panel shows, read once when the TUI starts.
+#[derive(Clone, Debug, Default)]
+pub struct Updates {
+    /// The GeoIP database's package version or file date, `not a file` or `not installed`.
+    pub geoip: String,
+    /// Where the database is, or where omash expects it, with the home directory as `~`.
+    pub geoip_path: String,
+    /// Omarchy keeps the system packages up to date (`omarchy update`).
+    pub omarchy: bool,
+}
+
+impl Updates {
+    pub fn detect() -> Self {
+        let (geoip, path) = geoip_status(
+            &Config::data_dir(),
+            &core::SYSTEM_GEOIP_DIRS.map(Path::new),
+            || installed_package_version("clash-geoip"),
+        );
+        Self {
+            geoip,
+            geoip_path: home_relative(&path, dirs::home_dir().as_deref()),
+            omarchy: on_path("omarchy", &std::env::var_os("PATH").unwrap_or_default()),
+        }
+    }
+}
+
+/// The GeoIP database the core will use and how to show it, following the choice
+/// `core::ensure_geoip_database` makes: the package version for a copy from a system directory,
+/// otherwise the file's date; and the database's path, or the path it will be linked or should
+/// be downloaded to.
+fn geoip_status(
+    data_dir: &Path,
+    system_dirs: &[&Path],
+    package_version: impl FnOnce() -> Option<String>,
+) -> (String, PathBuf) {
+    let destination = data_dir.join("Country.mmdb");
+    // The core removes dangling links before it chooses.
+    let candidate = core::geoip_candidates(data_dir)
+        .into_iter()
+        .find(|path| !core::is_dangling_link(path));
+    let (file, shown, system_copy) = match candidate {
+        Some(path) if !path.is_file() => return ("not a file".into(), path),
+        Some(path) => {
+            // omash links a system copy into the data directory by its absolute path.
+            let system_copy = fs::read_link(&path).is_ok_and(|target| {
+                target
+                    .parent()
+                    .is_some_and(|dir| system_dirs.contains(&dir))
+            });
+            (path.clone(), path, system_copy)
+        }
+        None => match core::system_geoip_database(system_dirs) {
+            Some(source) => (source, destination, true),
+            None => return ("not installed".into(), destination),
+        },
+    };
+    let shown_version = system_copy
+        .then(package_version)
+        .flatten()
+        .or_else(|| modified_date(&file))
+        .unwrap_or_else(|| "unknown".into());
+    (shown_version, shown)
+}
+
+/// The day `path`, after links, was last modified, in local time.
+fn modified_date(path: &Path) -> Option<String> {
+    let modified = fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()?;
+    Some(
+        chrono::DateTime::<chrono::Local>::from(modified)
+            .format("%Y-%m-%d")
+            .to_string(),
+    )
+}
+
+fn home_relative(path: &Path, home: Option<&Path>) -> String {
+    match home.and_then(|home| path.strip_prefix(home).ok()) {
+        Some(rest) => Path::new("~").join(rest).display().to_string(),
+        None => path.display().to_string(),
+    }
+}
+
+/// True when `program` is an executable file in one of the directories of `path_var`.
+fn on_path(program: &str, path_var: &OsStr) -> bool {
+    std::env::split_paths(path_var).any(|dir| {
+        fs::metadata(dir.join(program))
+            .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+    })
+}
+
+fn installed_package_version(name: &str) -> Option<String> {
     Command::new("pacman")
         .args(["-Q", name])
         .output()
@@ -1058,7 +1152,6 @@ fn installed_package_version(name: &str) -> String {
                 .map(|(_, version)| version.trim().to_owned())
         })
         .filter(|version| !version.is_empty())
-        .unwrap_or_else(|| "not installed".into())
 }
 
 #[cfg(test)]
@@ -1161,7 +1254,7 @@ mod tests {
             Vec::new(),
             Theme::default(),
             SupervisorState::default(),
-            String::new(),
+            Updates::default(),
         )
         .unwrap();
         let nodes: Vec<_> = (0..ROWS).map(|index| Rows::Nodes.label(index)).collect();
@@ -1268,7 +1361,7 @@ mod tests {
             Vec::new(),
             Theme::default(),
             SupervisorState::default(),
-            String::new(),
+            Updates::default(),
         )
         .unwrap();
         app.tab = Tab::Settings;
@@ -1327,5 +1420,200 @@ mod tests {
             );
             assert!(!app.config.tun_enabled, "the dialog alone turned TUN on");
         }
+    }
+
+    /// The Settings page as the terminal shows it, row by row.
+    fn settings_screen(updates: Updates, width: u16, height: u16) -> String {
+        let mut app = App::from_parts(
+            Config::default(),
+            Profiles::default(),
+            Vec::new(),
+            Theme::default(),
+            SupervisorState::default(),
+            updates,
+        )
+        .unwrap();
+        app.tab = Tab::Settings;
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        draw(&mut app, &mut terminal);
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect::<Vec<String>>()
+            .join("\n")
+    }
+
+    // 80 columns is the narrow layout; 88 the narrowest wide one, with the least room.
+    const UPDATES_SIZES: [(u16, u16); 3] = [(80, 24), (88, 24), (140, 40)];
+
+    #[test]
+    fn updates_panel_without_omarchy() {
+        let updates = Updates {
+            geoip: "2026-10-15".into(),
+            geoip_path: "~/.local/share/omash/Country.mmdb".into(),
+            omarchy: false,
+        };
+        for (width, height) in UPDATES_SIZES {
+            let screen = settings_screen(updates.clone(), width, height);
+            assert!(screen.contains(" Updates "), "{width}x{height}:\n{screen}");
+            assert!(
+                screen.contains("~/.local/share/omash/Country.mmdb  2026-10-15"),
+                "{width}x{height}:\n{screen}"
+            );
+            assert!(
+                !screen.contains("managed by Arch"),
+                "{width}x{height}:\n{screen}"
+            );
+        }
+    }
+
+    #[test]
+    fn updates_panel_on_omarchy() {
+        let updates = Updates {
+            geoip: "20260901-1".into(),
+            geoip_path: "~/.local/share/omash/Country.mmdb".into(),
+            omarchy: true,
+        };
+        for (width, height) in UPDATES_SIZES {
+            let screen = settings_screen(updates.clone(), width, height);
+            assert!(
+                screen.contains("Updates (managed by Arch)"),
+                "{width}x{height}:\n{screen}"
+            );
+            assert!(
+                screen.contains("Country.mmdb  20260901-1"),
+                "{width}x{height}:\n{screen}"
+            );
+        }
+    }
+
+    fn geoip_dirs() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let (data, system) = (root.path().join("data"), root.path().join("system"));
+        fs::create_dir(&data).unwrap();
+        fs::create_dir(&system).unwrap();
+        (root, data, system)
+    }
+
+    /// Writes a database file last modified at noon, local time, on `date`.
+    fn database(path: &Path, date: &str) {
+        fs::write(path, "db").unwrap();
+        let noon = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+            .and_local_timezone(chrono::Local)
+            .earliest()
+            .unwrap();
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(noon.into())
+            .unwrap();
+    }
+
+    fn status(data: &Path, system: &Path, version: Option<&str>) -> (String, PathBuf) {
+        geoip_status(data, &[system], || version.map(str::to_owned))
+    }
+
+    #[test]
+    fn geoip_display_of_a_linked_system_copy_is_the_package_version() {
+        let (_root, data, system) = geoip_dirs();
+        database(&system.join("Country.mmdb"), "2026-08-01");
+        std::os::unix::fs::symlink(system.join("Country.mmdb"), data.join("Country.mmdb")).unwrap();
+        assert_eq!(
+            status(&data, &system, Some("20260901-1")),
+            ("20260901-1".into(), data.join("Country.mmdb"))
+        );
+    }
+
+    #[test]
+    fn geoip_display_of_a_downloaded_file_is_its_date() {
+        let (_root, data, system) = geoip_dirs();
+        database(&data.join("Country.mmdb"), "2026-10-01");
+        assert_eq!(
+            status(&data, &system, Some("20260901-1")),
+            ("2026-10-01".into(), data.join("Country.mmdb"))
+        );
+    }
+
+    #[test]
+    fn geoip_display_passes_over_a_dangling_link() {
+        let (_root, data, system) = geoip_dirs();
+        std::os::unix::fs::symlink(system.join("gone"), data.join("Country.mmdb")).unwrap();
+        database(&data.join("country.mmdb"), "2026-09-30");
+        assert_eq!(
+            status(&data, &system, None),
+            ("2026-09-30".into(), data.join("country.mmdb"))
+        );
+        // Showing it changes nothing; the core removes the link when it starts.
+        assert!(fs::symlink_metadata(data.join("Country.mmdb")).is_ok());
+    }
+
+    #[test]
+    fn geoip_display_of_a_system_copy_to_be_linked() {
+        let (_root, data, system) = geoip_dirs();
+        database(&system.join("Country.mmdb"), "2026-08-01");
+        assert_eq!(
+            status(&data, &system, Some("20260901-1")),
+            ("20260901-1".into(), data.join("Country.mmdb"))
+        );
+        assert_eq!(
+            status(&data, &system, None),
+            ("2026-08-01".into(), data.join("Country.mmdb"))
+        );
+    }
+
+    #[test]
+    fn geoip_display_of_a_link_to_a_directory() {
+        let (_root, data, system) = geoip_dirs();
+        std::os::unix::fs::symlink(&system, data.join("Country.mmdb")).unwrap();
+        assert_eq!(
+            status(&data, &system, Some("20260901-1")),
+            ("not a file".into(), data.join("Country.mmdb"))
+        );
+    }
+
+    #[test]
+    fn geoip_display_without_a_database() {
+        let (_root, data, system) = geoip_dirs();
+        assert_eq!(
+            status(&data, &system, Some("20260901-1")),
+            ("not installed".into(), data.join("Country.mmdb"))
+        );
+    }
+
+    #[test]
+    fn geoip_display_path_starts_at_home() {
+        let path = Path::new("/home/u/.local/share/omash/Country.mmdb");
+        assert_eq!(
+            home_relative(path, Some(Path::new("/home/u"))),
+            "~/.local/share/omash/Country.mmdb"
+        );
+        assert_eq!(
+            home_relative(path, Some(Path::new("/root"))),
+            path.display().to_string()
+        );
+        assert_eq!(home_relative(path, None), path.display().to_string());
+    }
+
+    #[test]
+    fn omarchy_is_found_on_path() {
+        let root = tempfile::tempdir().unwrap();
+        let (empty, bin) = (root.path().join("empty"), root.path().join("bin"));
+        fs::create_dir(&empty).unwrap();
+        fs::create_dir(&bin).unwrap();
+        let program = bin.join("omarchy");
+        fs::write(&program, "#!/bin/sh\n").unwrap();
+        let both = std::env::join_paths([&empty, &bin]).unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!on_path("omarchy", &both));
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(on_path("omarchy", &both));
+        assert!(!on_path(
+            "omarchy",
+            &std::env::join_paths([&empty]).unwrap()
+        ));
     }
 }

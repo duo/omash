@@ -1168,36 +1168,52 @@ fn settings(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_widget(tun_notice(notice, &app.theme), updates_area);
         return;
     }
+    let updates = &app.updates;
+    let muted = Style::default().fg(app.theme.muted);
+    let foreground = Style::default().fg(app.theme.foreground);
+    let core = Line::from(vec![
+        Span::styled(
+            format!("{:<10}", app.profiles.current_core().as_str()),
+            muted,
+        ),
+        Span::styled(value_or_dash(&app.snapshot.version.version), foreground),
+    ]);
+    // The panel shows two rows of text; without Omarchy the database's path takes the place of
+    // its label.
+    let (title, lines) = if updates.omarchy {
+        (
+            " Updates (managed by Arch) ",
+            vec![
+                core,
+                Line::from(vec![
+                    Span::styled("Country.mmdb  ", muted),
+                    Span::styled(&updates.geoip, foreground),
+                ]),
+                Line::from(vec![
+                    Span::styled("Update  ", muted),
+                    Span::styled(
+                        "omarchy update",
+                        Style::default()
+                            .fg(app.theme.accent)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+            ],
+        )
+    } else {
+        (
+            " Updates ",
+            vec![
+                core,
+                Line::from(vec![
+                    Span::styled(format!("{}  ", updates.geoip_path), muted),
+                    Span::styled(&updates.geoip, foreground),
+                ]),
+            ],
+        )
+    };
     frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(vec![
-                Span::styled(
-                    format!("{:<10}", app.profiles.current_core().as_str()),
-                    Style::default().fg(app.theme.muted),
-                ),
-                Span::styled(
-                    value_or_dash(&app.snapshot.version.version),
-                    Style::default().fg(app.theme.foreground),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("Country.mmdb  ", Style::default().fg(app.theme.muted)),
-                Span::styled(
-                    &app.geoip_version,
-                    Style::default().fg(app.theme.foreground),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("Update  ", Style::default().fg(app.theme.muted)),
-                Span::styled(
-                    "omarchy update",
-                    Style::default()
-                        .fg(app.theme.accent)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]),
-        ])
-        .block(panel(" Updates (managed by Arch) ", &app.theme)),
+        Paragraph::new(lines).block(panel(title, &app.theme)),
         updates_area,
     );
 }

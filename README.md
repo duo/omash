@@ -11,7 +11,9 @@
 [Clash Verge Rev](https://github.com/clash-verge-rev/clash-verge-rev) and
 reworked as a fast, native terminal dashboard for Mihomo, built for
 [Omarchy](https://omarchy.org/). It carries the upstream Mihomo management
-design into a Rust TUI without a browser runtime.
+design into a Rust TUI without a browser runtime. It also runs on other Linux
+distributions with a systemd user session, without the Omarchy palette and
+Shell widget.
 
 The TUI is only the control surface. Mihomo runs under a user-level supervisor,
 so closing `omash` does not stop your proxy.
@@ -27,7 +29,8 @@ so closing `omash` does not stop your proxy.
 - Runs either the system Mihomo or sing-box core, auto-detected per profile
 - Supports Rule, Global, and Direct modes, proxy selection, and delay tests
 - Manages active connections, Merge enhancements, backups, and logs
-- Uses the system Mihomo and GeoIP packages maintained by Omarchy
+- Uses the system Mihomo, with Omarchy's GeoIP package or a downloaded
+  `Country.mmdb`
 - Keeps Mihomo running through a user service after the TUI closes
 - Offers optional Mihomo TUN with a capability-limited system helper
 - Updates `gsettings` and the UWSM/systemd environment for newly launched apps
@@ -61,6 +64,61 @@ binary and user service under your home directory. It does not install system
 packages or use `sudo`. On first launch, `omash` creates
 its configuration, starts the supervisor, and enables login startup because
 `auto_start = true` by default.
+
+### Other Linux distributions
+
+On other distributions, such as Ubuntu and Kubuntu, omash needs Rust to build,
+Mihomo at `/usr/bin/mihomo`, and a GeoIP database. Install Rust with
+[rustup](https://rustup.rs), and Mihomo from your distribution or as a `.deb`
+or `.rpm` from the [Mihomo releases](https://github.com/MetaCubeX/mihomo/releases),
+for example on Ubuntu or Kubuntu:
+
+```bash
+sudo apt install ./mihomo-linux-<arch>-<version>.deb
+```
+
+omash runs Mihomo itself, so leave the package's own `mihomo.service` disabled.
+
+Unless a package provides `/etc/mihomo/Country.mmdb` or
+`/etc/clash/Country.mmdb`, download the GeoIP database into omash's data
+directory:
+
+```bash
+# omash's data directory: $XDG_DATA_HOME/omash when XDG_DATA_HOME is an absolute path,
+# otherwise ~/.local/share/omash
+dir=${XDG_DATA_HOME:-}
+[[ $dir == /* ]] || dir=$HOME/.local/share
+dir=$dir/omash
+curl -fL --create-dirs -o "$dir/Country.mmdb.download" \
+  https://github.com/Loyalsoldier/geoip/releases/latest/download/Country.mmdb &&
+  mv -f "$dir/Country.mmdb.download" "$dir/Country.mmdb"
+```
+
+To update the database later, run these commands again, then
+`omash stop && omash start`. The core reads the database only once, and
+`omash restart` keeps the running core when its configuration is unchanged.
+
+Then install omash with the same command as on Omarchy:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/duo/omash/main/scripts/install | bash
+~/.local/bin/omash
+```
+
+Ubuntu and Kubuntu add `~/.local/bin` to `PATH` at login only if it already
+exists, so start omash as `~/.local/bin/omash` until you log in again.
+
+The system proxy setting changes GNOME's proxy settings (`gsettings`) and the
+systemd user environment, not KDE Plasma's own proxy settings. On Plasma, set
+the proxy in System Settings as well for applications that follow it, such as
+Chromium-based browsers.
+
+TUN mode works as described in the Mihomo TUN (Linux/systemd) section below.
+Ubuntu's default umask (0002) leaves omash's data directory writable by your
+group, which the TUN helper does not accept, so `omash tun setup` removes that
+permission. The directories above it must not be writable by their group or
+others either; if one is, setup names it and, for a directory you own, prints
+the `chmod go-w` command to run.
 
 ### Install from source
 
@@ -434,14 +492,15 @@ apply to Mihomo profiles.
 
 ### Theme override
 
-The TUI follows the current Omarchy palette by default. To override it:
+The TUI follows the current Omarchy palette by default, and uses its built-in
+palette elsewhere. To override it:
 
 ```bash
 mkdir -p ~/.config/omash
 cp themes/default.toml ~/.config/omash/theme.toml
 ```
 
-Changes reload automatically. Remove the file to follow Omarchy again; available
+Changes reload automatically. Remove the file to return to the default; available
 fields are documented in [`themes/default.toml`](themes/default.toml).
 
 ## Development

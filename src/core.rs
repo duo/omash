@@ -11,7 +11,9 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::process::Stdio;
 use std::{
+    ffi::OsStr,
     fs,
+    io::ErrorKind,
     path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime},
 };
@@ -384,7 +386,7 @@ pub fn ensure_system_core() -> Result<()> {
     let path = Config::core_path(core);
     if !path.is_file() {
         bail!(
-            "system {} not found at {}; install the Arch {} package",
+            "{} not found at {}; install the {} package for your distribution",
             core.as_str(),
             path.display(),
             core.as_str()
@@ -411,17 +413,96 @@ async fn restore_selected_nodes(config: &Config, profiles: &Profiles) -> Result<
     Ok(())
 }
 
+/// Where distribution packages install the GeoIP database.
+pub const SYSTEM_GEOIP_DIRS: [&str; 2] = ["/etc/mihomo", "/etc/clash"];
+
+/// The names Mihomo accepts for its GeoIP database in its home directory (`MMDB()` in its
+/// `constant/path.go`). It compares them with `strings.EqualFold`; an ASCII case-insensitive
+/// comparison agrees for these names, since none contains `k` or `s`, the only ASCII letters
+/// with non-ASCII case equivalents.
+const GEOIP_NAMES: [&str; 3] = ["Country.mmdb", "geoip.db", "geoip.metadb"];
+
+fn is_geoip_name(name: &OsStr, names: &[&str]) -> bool {
+    names.iter().any(|known| {
+        name.as_encoded_bytes()
+            .eq_ignore_ascii_case(known.as_bytes())
+    })
+}
+
+/// The entries of `dir` that Mihomo considers as its GeoIP database, in the order it tries them:
+/// it reads the directory sorted by name bytes, skips directories without following links, and
+/// takes the first entry whose name matches, whatever a link points to.
+pub fn geoip_candidates(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return vec![];
+    };
+    let mut names: Vec<_> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| !kind.is_dir()))
+        .map(|entry| entry.file_name())
+        .filter(|name| is_geoip_name(name, &GEOIP_NAMES))
+        .collect();
+    names.sort_by(|a, b| a.as_encoded_bytes().cmp(b.as_encoded_bytes()));
+    names.into_iter().map(|name| dir.join(name)).collect()
+}
+
+/// True for a symbolic link whose target does not exist.
+pub fn is_dangling_link(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_symlink())
+        && fs::metadata(path).is_err_and(|error| error.kind() == ErrorKind::NotFound)
+}
+
+/// The file in the system directories that omash links into the data directory: the first one
+/// named `Country.mmdb` in any case that is a regular file once links are followed.
+pub fn system_geoip_database(system_dirs: &[&Path]) -> Option<PathBuf> {
+    system_dirs.iter().find_map(|dir| {
+        geoip_candidates(dir)
+            .into_iter()
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(|name| is_geoip_name(name, &["Country.mmdb"]))
+            })
+            .find(|path| path.is_file())
+    })
+}
+
 fn ensure_core_resources() -> Result<()> {
-    let destination = Config::data_dir().join("Country.mmdb");
-    if destination.exists() {
-        return Ok(());
+    ensure_geoip_database(&Config::data_dir(), &SYSTEM_GEOIP_DIRS.map(Path::new))
+}
+
+/// Makes sure Mihomo, started with `data_dir` as its home, finds a usable GeoIP database there
+/// rather than downloading one of its own.
+fn ensure_geoip_database(data_dir: &Path, system_dirs: &[&Path]) -> Result<()> {
+    for candidate in geoip_candidates(data_dir) {
+        if candidate.is_file() {
+            return Ok(());
+        }
+        // Mihomo would choose a dangling link and fail. omash's own link to a system copy
+        // dangles once the package that provided the copy is removed.
+        if is_dangling_link(&candidate) {
+            fs::remove_file(&candidate).with_context(|| {
+                format!("failed to remove the dangling link {}", candidate.display())
+            })?;
+            continue;
+        }
+        bail!(
+            "{} is not a GeoIP database file; remove or replace it",
+            candidate.display()
+        );
     }
-    let source = ["/etc/mihomo/Country.mmdb", "/etc/clash/Country.mmdb"]
-        .into_iter()
-        .map(Path::new)
-        .find(|path| path.is_file())
-        .context("system Country.mmdb not found; install the Arch clash-geoip package")?;
-    link_or_copy(source, &destination).with_context(|| {
+    let destination = data_dir.join("Country.mmdb");
+    let source = system_geoip_database(system_dirs).with_context(|| {
+        format!(
+            "Country.mmdb not found; download it to {}, or install a package that provides it in {}",
+            destination.display(),
+            system_dirs
+                .iter()
+                .map(|dir| dir.display().to_string())
+                .collect::<Vec<_>>()
+                .join(" or ")
+        )
+    })?;
+    link_or_copy(&source, &destination).with_context(|| {
         format!(
             "failed to link system Country.mmdb from {} to {}",
             source.display(),
@@ -1730,6 +1811,129 @@ mod tests {
         assert!(!same.reloads(&service, false, true));
         let direct = candidate(TEXT, false, None, None);
         assert!(!direct.reloads(&direct, false, false));
+    }
+
+    // A data directory and a system directory; omash looks only at names and file types.
+    fn geoip_dirs() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let (data, system) = (root.path().join("data"), root.path().join("system"));
+        fs::create_dir(&data).unwrap();
+        fs::create_dir(&system).unwrap();
+        (root, data, system)
+    }
+
+    fn entries(dir: &Path) -> Vec<String> {
+        let mut names: Vec<_> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn geoip_candidates_follow_mihomo_order() {
+        let (_root, data, system) = geoip_dirs();
+        fs::write(data.join("geoip.metadb"), "db").unwrap();
+        fs::write(data.join("country.mmdb"), "db").unwrap();
+        std::os::unix::fs::symlink(system.join("gone"), data.join("Country.mmdb")).unwrap();
+        std::os::unix::fs::symlink(&system, data.join("GEOIP.db")).unwrap();
+        fs::create_dir(data.join("geoip.db")).unwrap();
+        fs::write(data.join("Country.mmdb.download"), "partial").unwrap();
+        fs::write(data.join("config.yaml"), "").unwrap();
+        let names: Vec<_> = geoip_candidates(&data)
+            .into_iter()
+            .map(|path| path.file_name().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            names,
+            ["Country.mmdb", "GEOIP.db", "country.mmdb", "geoip.metadb"]
+        );
+    }
+
+    #[test]
+    fn geoip_database_in_any_case() {
+        let (_root, data, system) = geoip_dirs();
+        fs::write(data.join("country.mmdb"), "db").unwrap();
+        ensure_geoip_database(&data, &[&system]).unwrap();
+        assert_eq!(entries(&data), ["country.mmdb"]);
+    }
+
+    #[test]
+    fn dangling_link_yields_to_the_next_database() {
+        let (_root, data, system) = geoip_dirs();
+        std::os::unix::fs::symlink(system.join("gone"), data.join("Country.mmdb")).unwrap();
+        fs::write(data.join("country.mmdb"), "db").unwrap();
+        ensure_geoip_database(&data, &[&system]).unwrap();
+        assert_eq!(entries(&data), ["country.mmdb"]);
+    }
+
+    #[test]
+    fn mihomo_names_are_accepted() {
+        let (_root, data, system) = geoip_dirs();
+        fs::write(data.join("geoip.metadb"), "db").unwrap();
+        ensure_geoip_database(&data, &[&system]).unwrap();
+        assert_eq!(entries(&data), ["geoip.metadb"]);
+    }
+
+    #[test]
+    fn unusable_candidate_is_reported() {
+        let (_root, data, system) = geoip_dirs();
+        let link = data.join("Country.mmdb");
+        std::os::unix::fs::symlink(&system, &link).unwrap();
+        let error = format!(
+            "{:#}",
+            ensure_geoip_database(&data, &[&system]).unwrap_err()
+        );
+        assert!(error.contains(&link.display().to_string()), "{error}");
+        assert!(fs::symlink_metadata(&link).unwrap().is_symlink());
+    }
+
+    #[test]
+    fn link_in_a_loop_is_reported_not_removed() {
+        let (_root, data, system) = geoip_dirs();
+        let link = data.join("Country.mmdb");
+        std::os::unix::fs::symlink("Country.mmdb", &link).unwrap();
+        fs::write(data.join("country.mmdb"), "db").unwrap();
+        let error = format!(
+            "{:#}",
+            ensure_geoip_database(&data, &[&system]).unwrap_err()
+        );
+        assert!(error.contains(&link.display().to_string()), "{error}");
+        assert!(fs::symlink_metadata(&link).unwrap().is_symlink());
+    }
+
+    #[test]
+    fn missing_database_names_the_destination() {
+        let (_root, data, system) = geoip_dirs();
+        let error = format!(
+            "{:#}",
+            ensure_geoip_database(&data, &[&system]).unwrap_err()
+        );
+        let destination = data.join("Country.mmdb");
+        assert!(
+            error.contains(&destination.display().to_string()),
+            "{error}"
+        );
+        assert!(!error.contains("Arch"), "{error}");
+    }
+
+    #[test]
+    fn system_copy_is_linked() {
+        let (_root, data, system) = geoip_dirs();
+        fs::write(system.join("Country.mmdb"), "db").unwrap();
+        ensure_geoip_database(&data, &[&system]).unwrap();
+        let link = fs::read_link(data.join("Country.mmdb")).unwrap();
+        assert_eq!(link, system.join("Country.mmdb"));
+    }
+
+    #[test]
+    fn system_copy_in_any_case_is_linked() {
+        let (_root, data, system) = geoip_dirs();
+        fs::write(system.join("country.mmdb"), "db").unwrap();
+        ensure_geoip_database(&data, &[&system]).unwrap();
+        let link = fs::read_link(data.join("Country.mmdb")).unwrap();
+        assert_eq!(link, system.join("country.mmdb"));
     }
 
     #[test]

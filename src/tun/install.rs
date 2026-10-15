@@ -78,11 +78,82 @@ fn safe_data_dir(path: &Path, uid: u32) -> Result<()> {
     }
     for part in path.ancestors() {
         let m = fs::symlink_metadata(part)?;
-        if m.file_type().is_symlink() || (m.uid() != 0 && m.uid() != uid) || m.mode() & 0o022 != 0 {
-            bail!("unsafe TUN data directory ancestry: {}", part.display());
+        let symlink = m.file_type().is_symlink();
+        if let Some(reason) = unsafe_ancestor(part, symlink, m.uid(), m.mode(), uid) {
+            bail!("unsafe TUN data directory ancestry: {reason}");
         }
     }
     Ok(())
+}
+/// Why one directory on the data path makes it unsafe for the helper, naming the fix when the
+/// installing user can apply it.
+fn unsafe_ancestor(part: &Path, symlink: bool, owner: u32, mode: u32, uid: u32) -> Option<String> {
+    let path = part.display();
+    if symlink {
+        Some(format!("{path} is a symbolic link"))
+    } else if owner != 0 && owner != uid {
+        Some(format!(
+            "{path} is owned by UID {owner}, not root or UID {uid}"
+        ))
+    } else if mode & 0o022 != 0 {
+        let fix = if owner == uid {
+            format!("; run: chmod go-w {path}")
+        } else {
+            String::new()
+        };
+        Some(format!("{path} is writable by its group or others{fix}"))
+    } else {
+        None
+    }
+}
+/// Removes group and other write permission from the data directory, which a umask such as
+/// Ubuntu's 0002 leaves when omash creates it. A path that `open_dir_nofollow` refuses is left
+/// unchanged, for `safe_data_dir` to judge.
+fn private_data_dir(path: &Path, uid: u32) -> Result<bool> {
+    let Ok(dir) = open_dir_nofollow(path) else {
+        return Ok(false);
+    };
+    make_private(&dir, uid).with_context(|| {
+        format!(
+            "cannot remove group and other write permission from {}",
+            path.display()
+        )
+    })
+}
+/// Opens a directory one component at a time and refuses a symbolic link in any of them, so that
+/// what is inspected through the handle is what is changed, even if the path is replaced. The
+/// path must be absolute and name every component plainly: no `.`, `..` or empty component.
+fn open_dir_nofollow(path: &Path) -> std::io::Result<fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    // The bytes are split by hand: `Path::components` would quietly drop `.` and repeated slashes.
+    let Some(relative) = path.as_os_str().as_bytes().strip_prefix(b"/") else {
+        return Err(std::io::ErrorKind::InvalidInput.into());
+    };
+    let mut dir = fs::File::open("/")?;
+    for name in relative.split(|&byte| byte == b'/') {
+        if matches!(name, b"" | b"." | b"..") {
+            return Err(std::io::ErrorKind::InvalidInput.into());
+        }
+        let name = std::ffi::CString::new(name)?;
+        let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        dir = unsafe { fs::File::from_raw_fd(fd) };
+    }
+    Ok(dir)
+}
+fn make_private(dir: &fs::File, uid: u32) -> Result<bool> {
+    use std::os::unix::fs::PermissionsExt;
+    let metadata = dir.metadata()?;
+    let mode = metadata.mode() & 0o7777;
+    if !metadata.is_dir() || metadata.uid() != uid || mode & 0o022 == 0 {
+        return Ok(false);
+    }
+    dir.set_permissions(fs::Permissions::from_mode(mode & !0o022))?;
+    Ok(true)
 }
 fn target(path: &Path) -> Result<()> {
     let parent = path
@@ -232,6 +303,12 @@ pub async fn install_helper() -> Result<()> {
     }
     let dir = crate::config::Config::data_dir();
     fs::create_dir_all(&dir)?;
+    if private_data_dir(&dir, uid)? {
+        println!(
+            "Made {} writable only by you, as the TUN helper requires.",
+            dir.display()
+        );
+    }
     safe_data_dir(&dir, uid)?;
     let exe = std::env::current_exe()?;
     let digest = super::protocol::revision(&fs::read(&exe)?);
@@ -346,6 +423,153 @@ mod tests {
         let file = dir.path().join("core");
         fs::write(&file, b"not trusted").unwrap();
         assert!(trusted_path(&file, true).is_err());
+    }
+    #[test]
+    fn unsafe_ancestry_names_the_reason() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let uid = fs::metadata(&root).unwrap().uid();
+        let parent = root.join("parent");
+        let data = parent.join("omash");
+        fs::create_dir_all(&data).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o775)).unwrap();
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o755)).unwrap();
+        // The check stops at `parent`, before the machine's own ancestors such as /tmp.
+        let error = safe_data_dir(&data, uid).unwrap_err().to_string();
+        let parent = parent.display();
+        assert_eq!(
+            error,
+            format!(
+                "unsafe TUN data directory ancestry: {parent} is writable by its group or others; run: chmod go-w {parent}"
+            )
+        );
+    }
+    #[test]
+    fn group_writable_data_directory_is_made_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let uid = fs::metadata(&root).unwrap().uid();
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+        for (before, after) in [(0o775, 0o755), (0o770, 0o750), (0o777, 0o755)] {
+            let data = root.join(format!("{before:o}"));
+            fs::create_dir(&data).unwrap();
+            fs::set_permissions(&data, fs::Permissions::from_mode(before)).unwrap();
+            assert!(private_data_dir(&data, uid).unwrap());
+            assert_eq!(mode(&data), after);
+            assert!(!private_data_dir(&data, uid).unwrap());
+        }
+        let private = root.join("private");
+        fs::create_dir(&private).unwrap();
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(!private_data_dir(&private, uid).unwrap());
+        assert_eq!(mode(&private), 0o700);
+    }
+    #[test]
+    fn only_the_owners_real_directory_is_changed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let uid = fs::metadata(&root).unwrap().uid();
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+        let real = root.join("real");
+        let data = real.join("omash");
+        fs::create_dir_all(&data).unwrap();
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o775)).unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&data, &link).unwrap();
+        let through = root.join("through");
+        std::os::unix::fs::symlink(&real, &through).unwrap();
+        assert!(!private_data_dir(&link, uid).unwrap());
+        assert!(!private_data_dir(&through.join("omash"), uid).unwrap());
+        assert!(!private_data_dir(&data, uid.wrapping_add(1)).unwrap());
+        assert_eq!(mode(&data), 0o775);
+        let file = root.join("file");
+        fs::write(&file, b"").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o664)).unwrap();
+        assert!(!private_data_dir(&file, uid).unwrap());
+        assert_eq!(mode(&file), 0o664);
+    }
+    #[test]
+    fn data_directory_is_opened_without_following_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let real = root.join("real");
+        let data = real.join("omash");
+        fs::create_dir_all(&data).unwrap();
+        let opened = open_dir_nofollow(&data).unwrap();
+        assert_eq!(
+            opened.metadata().unwrap().ino(),
+            fs::metadata(&data).unwrap().ino()
+        );
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&data, &link).unwrap();
+        assert!(open_dir_nofollow(&link).is_err());
+        let through = root.join("through");
+        std::os::unix::fs::symlink(&real, &through).unwrap();
+        assert!(open_dir_nofollow(&through.join("omash")).is_err());
+        // Spelled out, since `Path::components` would quietly drop `.` and repeated slashes.
+        let spelled =
+            |path: &Path, rest: &str| std::path::PathBuf::from(format!("{}{rest}", path.display()));
+        for path in [
+            Path::new("real/omash").to_path_buf(),
+            real.join("../real/omash"),
+            real.join("./omash"),
+            data.join("."),
+            spelled(&real, "//omash"),
+            spelled(&data, "/"),
+        ] {
+            let error = open_dir_nofollow(&path).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{path:?}");
+        }
+    }
+    #[test]
+    fn a_replaced_data_directory_does_not_redirect_the_change() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let uid = fs::metadata(&root).unwrap().uid();
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+        let data = root.join("omash");
+        fs::create_dir(&data).unwrap();
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o775)).unwrap();
+        let secret = root.join("secret");
+        fs::write(&secret, b"").unwrap();
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+        let opened = open_dir_nofollow(&data).unwrap();
+        // Another account replaces the path after it was opened.
+        let moved = root.join("moved");
+        fs::rename(&data, &moved).unwrap();
+        std::os::unix::fs::symlink(&secret, &data).unwrap();
+        assert!(make_private(&opened, uid).unwrap());
+        assert_eq!(mode(&moved), 0o755);
+        assert_eq!(mode(&secret), 0o600);
+    }
+    #[test]
+    fn ancestor_reasons() {
+        let part = Path::new("/home/user/.local");
+        let reason = |symlink, owner, mode| unsafe_ancestor(part, symlink, owner, mode, 1000);
+        assert_eq!(
+            reason(true, 1000, 0o777).as_deref(),
+            Some("/home/user/.local is a symbolic link")
+        );
+        assert_eq!(
+            reason(false, 1001, 0o755).as_deref(),
+            Some("/home/user/.local is owned by UID 1001, not root or UID 1000")
+        );
+        assert_eq!(
+            reason(false, 1000, 0o775).as_deref(),
+            Some(
+                "/home/user/.local is writable by its group or others; run: chmod go-w /home/user/.local"
+            )
+        );
+        assert_eq!(
+            reason(false, 0, 0o1777).as_deref(),
+            Some("/home/user/.local is writable by its group or others")
+        );
+        assert_eq!(reason(false, 0, 0o755), None);
+        assert_eq!(reason(false, 1000, 0o750), None);
     }
     #[test]
     fn service_unit_limits_capabilities() {

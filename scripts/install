@@ -11,30 +11,107 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if ! command -v omarchy >/dev/null 2>&1; then
-  echo "omash currently supports Omarchy only." >&2
-  exit 1
+omarchy=false
+if command -v omarchy >/dev/null 2>&1; then
+  omarchy=true
 fi
 
-for command in cargo curl tar install sed systemctl; do
+for command in cargo curl tar install sed stat systemctl; do
   if ! command -v "$command" >/dev/null 2>&1; then
     echo "$command is required to install omash." >&2
     if [[ $command == cargo ]]; then
-      echo "Install it first with: omarchy install dev-env rust" >&2
+      if $omarchy; then
+        echo "Install it first with: omarchy install dev-env rust" >&2
+      else
+        echo "Install Rust first with rustup: https://rustup.rs" >&2
+      fi
     fi
     exit 1
   fi
 done
 
-missing_packages=()
-[[ -x /usr/bin/mihomo ]] || missing_packages+=(mihomo)
-if [[ ! -f /etc/mihomo/Country.mmdb && ! -f /etc/clash/Country.mmdb ]]; then
-  missing_packages+=(clash-geoip)
+# omash's data directory, which the core runs in: like the dirs crate, only an absolute
+# XDG_DATA_HOME counts.
+data_home=${XDG_DATA_HOME:-}
+[[ $data_home == /* ]] || data_home=$HOME/.local/share
+data_dir=$data_home/omash
+
+# The entry of a directory that Mihomo takes as its GeoIP database, as omash finds it before
+# starting the core (geoip_candidates in src/core.rs): the first name, in byte order, that is
+# Country.mmdb, geoip.db or geoip.metadb in any case, leaving out directories (but not links to
+# them) and dangling links, which omash removes.
+first_geoip_candidate() {
+  local LC_ALL=C entry name
+  for entry in "$1"/*; do
+    name=${entry##*/}
+    case ${name,,} in
+      country.mmdb | geoip.db | geoip.metadb) ;;
+      *) continue ;;
+    esac
+    [[ -d $entry && ! -L $entry ]] && continue
+    is_dangling_link "$entry" && continue
+    printf '%s\n' "$entry"
+    return 0
+  done
+  return 1
+}
+
+# A link whose target does not exist (ENOENT), as is_dangling_link in src/core.rs decides. A
+# target that cannot be looked up for another reason, such as a loop or a directory without
+# search permission, leaves the link in place as an unusable database.
+is_dangling_link() {
+  local error
+  [[ -L $1 ]] || return 1
+  error=$(LC_ALL=C stat -L -- "$1" 2>&1 >/dev/null) && return 1
+  # GNU's stat ends with the error's description, while uutils' stat, Ubuntu's default, adds
+  # " (os error 2)" after it.
+  [[ $error == *": No such file or directory"* ]]
+}
+
+# A Country.mmdb, in any case, from a distribution package, which omash links into its data
+# directory.
+has_system_geoip_database() {
+  local LC_ALL=C entry name
+  for entry in /etc/mihomo/* /etc/clash/*; do
+    name=${entry##*/}
+    [[ ${name,,} == country.mmdb && -f $entry ]] && return 0
+  done
+  return 1
+}
+
+missing_mihomo=false
+[[ -x /usr/bin/mihomo ]] || missing_mihomo=true
+missing_geoip=false
+if geoip_database=$(first_geoip_candidate "$data_dir"); then
+  if [[ ! -f $geoip_database ]]; then
+    echo "$geoip_database is not a GeoIP database file; remove or replace it." >&2
+    exit 1
+  fi
+elif ! has_system_geoip_database; then
+  missing_geoip=true
 fi
 
-if (( ${#missing_packages[@]} )); then
-  echo "Install the required system packages first:" >&2
-  echo "  omarchy pkg aur add ${missing_packages[*]}" >&2
+if $missing_mihomo || $missing_geoip; then
+  if $omarchy; then
+    missing_packages=()
+    $missing_mihomo && missing_packages+=(mihomo)
+    $missing_geoip && missing_packages+=(clash-geoip)
+    echo "Install the required system packages first:" >&2
+    echo "  omarchy pkg aur add ${missing_packages[*]}" >&2
+  else
+    if $missing_mihomo; then
+      echo "omash needs Mihomo at /usr/bin/mihomo: install your distribution's package, or a .deb or .rpm from https://github.com/MetaCubeX/mihomo/releases" >&2
+    fi
+    if $missing_geoip; then
+      # Downloading beside the file and renaming it replaces a link instead of writing through it.
+      printf -v download '%q' "$data_dir/Country.mmdb.download"
+      printf -v database '%q' "$data_dir/Country.mmdb"
+      echo "omash needs a GeoIP database. Download it with:" >&2
+      echo "  curl -fL --create-dirs -o $download \\" >&2
+      echo "    https://github.com/Loyalsoldier/geoip/releases/latest/download/Country.mmdb &&" >&2
+      echo "    mv -f $download $database" >&2
+    fi
+  fi
   exit 1
 fi
 
